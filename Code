@@ -1,0 +1,356 @@
+#Cell 1 – Import thư viện
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+import category_encoders as ce
+import matplotlib.pyplot as plt
+import seaborn as sns
+import nltk
+from transformers import AutoTokenizer, AutoModel
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.metrics import classification_report, confusion_matrix
+
+nltk.download("stopwords")
+
+#Đọc dữ liệu
+file_path = "/kaggle/input/daylalancuoihuhu/loan_data.xlsx"
+df = pd.read_excel(file_path)
+
+print("Dữ liệu đã load:", df.shape)
+display(df.head())
+#Xóa các dòng chứa giá trị thiếu
+df = df.dropna()
+print("Sau khi xóa NaN:", df.shape)
+
+#Tạo các đặc trưng logic
+df["debt_to_income_ratio"] = df["total_outstanding_debt"] / (df["monthly_income"] + 1e-3)
+df["expense_to_income"] = df["estimated_monthly_expense"] / (df["monthly_income"] + 1e-3)
+df["is_unemployed"] = (df["employment_status"] == "Unemployed").astype(int)
+
+#Điểm rủi ro kết hợp
+df["risk_score_raw"] = (
+    df["expense_to_income"] * 0.4 +
+    df["debt_to_income_ratio"] * 0.4 +
+    (df["total_late_payments"] + df["num_late_payments_in_app"]) * 0.2
+).round(3)
+
+#Số khoản vay tổng
+df["loan_count_score"] = df["number_of_current_loans"] + df["num_loans_from_app"]
+
+#CBM Feature
+df["cbm_feature_1"] = df["wallet_usage_frequency"] * df["bank_avg_balance"]
+df["cbm_feature_2"] = df["risk_score_raw"] * df["loan_count_score"]
+
+#Trích từ khóa bằng TF-IDF
+from sklearn.feature_extraction.text import TfidfVectorizer
+from nltk.corpus import stopwords
+
+corpus = df["loan_purpose_text"].astype(str).tolist()
+vectorizer = TfidfVectorizer(max_features=1000, stop_words=stopwords.words("english"))
+X_text = vectorizer.fit_transform(corpus)
+
+feature_names = np.array(vectorizer.get_feature_names_out())
+top_keywords = []
+
+for row in X_text:
+    indices = np.argsort(row.toarray()).flatten()[::-1][:3]
+    keywords = feature_names[indices]
+    top_keywords.append(", ".join(keywords))
+
+df["loan_keywords"] = top_keywords
+#Kiểm tra các cột đã tạo
+display(df[[
+    "debt_to_income_ratio", "expense_to_income", "is_unemployed",
+    "risk_score_raw", "loan_count_score", "cbm_feature_1", "cbm_feature_2", "loan_keywords"
+]].head())
+#Cell 3 – Feature Engineering & Keyphrase Extraction
+from nltk.corpus import stopwords
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+#Xóa dòng null, KHÔNG xóa dòng có income = 0
+df = df.dropna()
+
+#Tạo đặc trưng phụ trợ
+df["debt_to_income_ratio"] = df["total_outstanding_debt"] / (df["monthly_income"] + 1e-3)
+df["expense_to_income"] = df["estimated_monthly_expense"] / (df["monthly_income"] + 1e-3)
+df["is_unemployed"] = (df["employment_status"] == "Unemployed").astype(int)
+
+#Tạo điểm rủi ro thô kết hợp nhiều yếu tố
+df["risk_score_raw"] = (
+    df["expense_to_income"] * 0.4
+    + df["debt_to_income_ratio"] * 0.4
+    + (df["total_late_payments"] + df["num_late_payments_in_app"]) * 0.2
+).round(3)
+
+#Tổng số khoản vay
+df["loan_count_score"] = df["number_of_current_loans"] + df["num_loans_from_app"]
+
+#Tạo đặc trưng trung gian CBM
+df["cbm_feature_1"] = df["wallet_usage_frequency"] * df["bank_avg_balance"]
+df["cbm_feature_2"] = df["risk_score_raw"] * df["loan_count_score"]
+
+#Trích xuất từ khóa từ văn bản `loan_purpose_text`
+corpus = df["loan_purpose_text"].astype(str).tolist()
+vectorizer = TfidfVectorizer(max_features=1000, stop_words=stopwords.words("english"))
+X_text = vectorizer.fit_transform(corpus)
+
+feature_names = np.array(vectorizer.get_feature_names_out())
+top_keywords = []
+
+for row in X_text:
+    indices = np.argsort(row.toarray()).flatten()[::-1][:3]
+    keywords = feature_names[indices]
+    top_keywords.append(", ".join(keywords))
+df["loan_keywords"] = top_keywords
+
+#Kiểm tra nhanh kết quả
+df[["loan_purpose_text", "loan_keywords"]].head(10)
+
+#Cell 4 – Encode Tabular + Tokenize Text (FinBERT)
+
+from sklearn.preprocessing import StandardScaler
+import category_encoders as ce
+from transformers import AutoTokenizer
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, TensorDataset
+
+#cột đầu ra và cột văn bản
+label_col = "default"
+text_col = "loan_keywords"
+
+#Tập các đặc trưng tabular đầu vào (bao gồm cả CBM)
+selected_features = [
+    "age", "gender", "marital_status", "residential_area", "monthly_income", "estimated_monthly_expense",
+    "employment_status", "job_type", "total_outstanding_debt", "number_of_current_loans", "total_late_payments",
+    "num_loans_from_app", "num_late_payments_in_app", "has_bank_account_linked", "bank_avg_balance",
+    "has_e_wallet_linked", "wallet_usage_frequency", 
+    "cbm_feature_1", "cbm_feature_2"
+]
+
+# Tách dữ liệu tabular và text
+X_tabular = df[selected_features].copy()
+X_text = df[text_col].astype(str)
+y = df[label_col]
+
+# Encode các cột dạng phân loại
+categorical_cols = X_tabular.select_dtypes(include="object").columns.tolist()
+encoder = ce.OrdinalEncoder(cols=categorical_cols)
+X_encoded = encoder.fit_transform(X_tabular)
+
+#Scale đặc trưng số
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X_encoded)
+
+#Tokenize văn bản bằng FinBERT
+model_name = "yiyanghkust/finbert-tone"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+encoded_text = tokenizer(
+    X_text.tolist(),
+    padding=True,
+    truncation=True,
+    max_length=32,
+    return_tensors="pt"
+)
+
+# Biến mục tiêu
+y_tensor = torch.tensor(y.values, dtype=torch.float32).unsqueeze(1)
+
+# 🧪 Chia train/test
+X_tab_train, X_tab_test, ids_train, ids_test, y_train, y_test, mask_train, mask_test = train_test_split(
+    torch.tensor(X_scaled, dtype=torch.float32),
+    encoded_text["input_ids"],
+    y_tensor,
+    encoded_text["attention_mask"],
+    test_size=0.2,
+    random_state=42
+)
+
+# Tạo Dataloader
+train_dataset = TensorDataset(X_tab_train, ids_train, mask_train, y_train)
+test_dataset = TensorDataset(X_tab_test, ids_test, mask_test, y_test)
+
+train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
+
+print("Dữ liệu đã sẵn sàng cho mô hình huấn luyện.")
+#Cell 5 – Define và khởi tạo mô hình Hybrid TabTransformer + FinBERT + CBM
+
+import torch.nn as nn
+from transformers import AutoModel
+
+# Khai báo device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+class TabFinBERT_CBModel(nn.Module):
+    def __init__(self, tab_input_dim, text_model_name="yiyanghkust/finbert-tone", d_model=128, n_heads=4, dropout=0.1):
+        super().__init__()
+
+        self.tabular_proj = nn.Linear(tab_input_dim, d_model)
+        self.tab_transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=d_model, nhead=n_heads, dropout=dropout, batch_first=True),
+            num_layers=2
+        )
+
+        self.text_encoder = AutoModel.from_pretrained(text_model_name)
+        self.text_proj = nn.Linear(self.text_encoder.config.hidden_size, d_model)
+
+        self.cbm_proj = nn.Sequential(
+            nn.Linear(2, d_model),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+
+        self.final = nn.Sequential(
+            nn.Linear(d_model * 3, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        )
+
+    def forward(self, x_tab, input_ids, attention_mask, cbm):
+        tab_encoded = self.tabular_proj(x_tab)
+        tab_out = self.tab_transformer(tab_encoded.unsqueeze(1)).squeeze(1)
+
+        text_out = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
+        pooled = text_out.pooler_output
+        text_out = self.text_proj(pooled)
+
+        cbm_out = self.cbm_proj(cbm)
+        combined = torch.cat([tab_out, text_out, cbm_out], dim=1)
+
+        return self.final(combined)
+
+#Khởi tạo mô hình
+tab_input_dim = X_tab_train.shape[1]
+model = TabFinBERT_CBModel(tab_input_dim=tab_input_dim).to(device)
+
+print("Mô hình đã khởi tạo xong.")
+#Cell 6 – Huấn luyện mô hình với BCEWithLogitsLoss + Early Stopping
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import roc_auc_score
+
+# Tính pos_weight cho BCEWithLogitsLoss
+class_weights = compute_class_weight(class_weight='balanced', classes=np.array([0, 1]), y=df["default"])
+pos_weight = torch.tensor([class_weights[1] / class_weights[0]]).to("cuda" if torch.cuda.is_available() else "cpu")
+
+criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=4, factor=0.5, verbose=True)
+
+# Early stopping config
+best_loss = float('inf')
+best_model_state = None
+counter = 0
+patience = 8
+
+train_losses, test_losses = [], []
+epochs = 50
+
+for epoch in range(1, epochs + 1):
+    model.train()
+    total_train_loss = 0
+
+    for x_tab, ids, mask, yb in train_loader:
+        x_tab, ids, mask, yb = x_tab.to(device), ids.to(device), mask.to(device), yb.to(device)
+        cbm = x_tab[:, -2:]  # CBM là 2 cột cuối trong tabular
+
+        optimizer.zero_grad()
+        logits = model(x_tab, ids, mask, cbm)
+        loss = criterion(logits, yb)
+        loss.backward()
+        optimizer.step()
+
+        total_train_loss += loss.item()
+
+    avg_train_loss = total_train_loss / len(train_loader)
+    train_losses.append(avg_train_loss)
+
+    # Validation
+    model.eval()
+    total_test_loss = 0
+    all_preds, all_labels = [], []
+
+    with torch.no_grad():
+        for x_tab, ids, mask, yb in test_loader:
+            x_tab, ids, mask, yb = x_tab.to(device), ids.to(device), mask.to(device), yb.to(device)
+            cbm = x_tab[:, -2:]
+            logits = model(x_tab, ids, mask, cbm)
+            loss = criterion(logits, yb)
+            total_test_loss += loss.item()
+
+            preds = torch.sigmoid(logits)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(yb.cpu().numpy())
+
+    avg_test_loss = total_test_loss / len(test_loader)
+    test_losses.append(avg_test_loss)
+
+    # AUC
+    try:
+        auc = roc_auc_score(all_labels, all_preds)
+    except:
+        auc = -1
+
+    print(f"poch {epoch:02d} | Train Loss: {avg_train_loss:.4f} | Test Loss: {avg_test_loss:.4f} | AUC: {auc:.4f}")
+
+    scheduler.step(avg_test_loss)
+
+    if avg_test_loss < best_loss:
+        best_loss = avg_test_loss
+        best_model_state = model.state_dict()
+        counter = 0
+    else:
+        counter += 1
+        if counter >= patience:
+            print("Early stopping triggered.")
+            break
+
+# Load best model
+if best_model_state:
+    model.load_state_dict(best_model_state)
+    print("Loaded best model with lowest test loss.")
+# Chuyển xác suất thành nhãn nhị phân với ngưỡng 0.5
+y_pred = np.array(all_preds).flatten()
+y_true = np.array(all_labels).flatten()
+y_pred_binary = (y_pred > 0.5).astype(int)
+
+from sklearn.metrics import (
+    classification_report, confusion_matrix, ConfusionMatrixDisplay,
+    roc_auc_score, roc_curve, precision_recall_curve, average_precision_score,
+    matthews_corrcoef, log_loss
+)
+import matplotlib.pyplot as plt
+
+#Classification Report
+print("Classification Report:\n")
+print(classification_report(y_true, y_pred_binary, digits=4))
+
+#Confusion Matrix
+cm = confusion_matrix(y_true, y_pred_binary)
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["No Default", "Default"])
+disp.plot(cmap="Blues", values_format='d')
+plt.title("Confusion Matrix")
+plt.grid(False)
+plt.show()
+
+#Các chỉ số đánh giá thêm (tùy chọn)
+print("Extra Metrics:")
+print("AUC Score:", roc_auc_score(y_true, y_pred))
+print("Average Precision:", average_precision_score(y_true, y_pred))
+print("Matthews Correlation Coefficient:", matthews_corrcoef(y_true, y_pred_binary))
+print("Log Loss:", log_loss(y_true, y_pred))
+plt.plot(train_losses, label="Train Loss")
+plt.plot(test_losses, label="Test Loss")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.legend()
+plt.title("Loss per Epoch")
+plt.grid(True)
+plt.show()
